@@ -4,7 +4,8 @@
 
 ## Prerequisites
 
-- Start from a clean `main`.
+- Start from a clean `main` that exactly matches `origin/main`.
+- For a real merge, require strict up-to-date branch protection with required checks, administrator enforcement, no applicable ruleset bypass actors, and no merge queue. Dry runs remain available without this server-side prerequisite.
 - Make sure [`.github/MAINTENANCE.md`](../../.github/MAINTENANCE.md) is the governing policy.
 - Have `gh` authenticated with maintainer permissions.
 - Use this only for PRs that are already expected to merge; conflicting PRs still need the manual conflict playbook.
@@ -32,9 +33,11 @@ Use `--dry-run` to exercise local classification without approving a run or merg
 - refresh the PR body when the Quality Bar checklist is missing
 - close and reopen the PR if stale metadata needs a fresh `pull_request` event
 - fetch the exact base/head objects and classify the complete raw Git diff
+- recompute changed-skill evidence with evaluator code materialized from the trusted `main` commit
+- reject incomplete evidence coverage, deterministic quality/security/provenance regressions, and base/head drift
 - approve fork runs waiting on `action_required` only when every path, mode, object, size, and workflow identity is allowlisted
 - wait for the fresh required checks on the current head SHA
-- merge with GitHub squash merge
+- call GitHub's immediate squash-merge endpoint and continue only when it reports `merged: true`
 - pull `main`, run `sync:contributors`, and push a README-only follow-up if needed
 
 ## What It Automates
@@ -43,7 +46,6 @@ Use `--dry-run` to exercise local classification without approving a run or merg
 - stale PR metadata refresh
 - required-check polling for the current PR head
 - the post-merge contributor sync step
-- the retry loop for `Base branch was modified`
 
 ## What It Does Not Automate
 
@@ -52,6 +54,8 @@ Use `--dry-run` to exercise local classification without approving a run or merg
 - semantic review when the distinct `manual-review-required` check is present
 - README community-source audits when the source metadata is ambiguous
 - fork-only edge cases that require contributor coordination outside GitHub permissions
+- base-branch drift: stale evidence is discarded and the batch must be rerun
+- auto-merge and merge-queue enrollment; deferred merge state is rejected
 
 ## When To Stop
 
@@ -63,5 +67,6 @@ Stop and switch to the manual playbook when:
 - the local diff contains a symlink, gitlink, executable mode, unknown path/type, oversized blob, or other non-allowlisted change
 - the workflow run cannot be bound to the intended PR number, current head SHA, `pull_request` event, and trusted workflow definition
 - fork approval or branch permissions are missing
+- effective strict protection for `main` cannot be proven
 
 In those cases, follow [Merging Pull Requests](merging-prs.md) and the relevant sections in [MAINTENANCE.md](../../.github/MAINTENANCE.md).

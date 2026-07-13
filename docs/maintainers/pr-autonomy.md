@@ -8,6 +8,8 @@ Pull-request CI is unprivileged: it has read-only repository permissions and rec
 
 Any privileged or local maintainer action must recompute its decision from trusted `main` code against immutable base and head object IDs. It must not consume the pull-request-generated decision artifact as authorization.
 
+`merge:batch` therefore materializes the evaluator from the exact local `main` commit after proving that local `HEAD` equals `origin/main`. It runs that tracked-only evaluator in an isolated Python process; untracked workspace files, pull-request scripts, Python environment overrides, and uploaded artifacts are not part of the authorization path.
+
 ## Evidence Artifacts
 
 The `pr-evidence` CI job produces:
@@ -55,9 +57,15 @@ A successful `manual-review-required` check means only that the requirement was 
 3. computes a complete NUL-delimited raw Git diff with full object IDs and modes;
 4. rejects unsafe paths, modes, symlinks, gitlinks, executable files, unknown types, oversized blobs, incomplete metadata, or non-allowlisted workflows;
 5. verifies workflow event, workflow identity, pull-request number, and head SHA;
-6. re-reads the pull-request head before and after approval.
+6. recomputes changed-skill evidence over the exact merge-base-to-head record set and requires one-to-one coverage of every skill-content Git record;
+7. rejects operational errors, malformed evidence, incomplete snapshots, score-component regressions, provenance identity regressions, or any other deterministic blocker;
+8. re-reads both pull-request base and head before and after approval and immediately before merge.
+
+A real merge also requires effective server-side protection for `main`: nonempty strict status checks, enforcement for administrators, no applicable ruleset bypass actors, and no merge queue. If that enforcement cannot be proven, `merge:batch` refuses non-dry-run operation. Base drift is never retried with stale evidence; the batch must be rerun from the new tuple. Pre-existing auto-merge state is rejected, and the immediate GitHub merge endpoint must return `merged: true` before post-merge work begins.
 
 For canonical `SKILL.md` or allowlisted supporting skill-content changes, the maintainer supplies `--reviewed-head <full-sha>`. A stale, abbreviated, or mismatched SHA fails closed. The Skill Review check itself is required only for `SKILL.md` changes because that workflow is path-filtered; support-only changes still require the exact-SHA human attestation.
+
+Deletions, copies, ambiguous moves, and all canonical skill-content changes remain manual-only in this stage even when deterministic evidence contains no regression. A passing ratchet is not semantic approval and never makes a skill eligible for automatic merge.
 
 ## Later Phases
 

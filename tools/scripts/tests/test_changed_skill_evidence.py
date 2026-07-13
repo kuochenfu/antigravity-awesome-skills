@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -399,6 +400,97 @@ class ChangedSkillEvidenceTests(unittest.TestCase):
         git(root, "commit", "-m", "complete provenance")
         complete = changed_skill_evidence.build_report(root, base, "HEAD")
         self.assertFalse(any("new_external_skill_" in reason for reason in complete["reasons"]))
+
+    def test_modified_external_skill_cannot_remove_or_change_provenance_identity(self):
+        root, _ = init_repo(with_skill=False)
+        path = write_skill(
+            root,
+            "external",
+            source="community",
+            source_type="community",
+            source_repo="owner/community",
+        )
+        git(root, "add", ".")
+        git(root, "commit", "-m", "external base")
+        base = git(root, "rev-parse", "HEAD")
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            .replace("source: community", "source: self")
+            .replace("source_type: community\n", "")
+            .replace("source_repo: owner/community\n", ""),
+            encoding="utf-8",
+        )
+        git(root, "add", ".")
+        git(root, "commit", "-m", "remove provenance")
+
+        report = changed_skill_evidence.build_report(root, base, "HEAD")
+
+        self.assertTrue(report["blocking"])
+        self.assertIn("external:provenance_identity_changed:source", report["reasons"])
+        self.assertIn("external:provenance_identity_changed:source_type", report["reasons"])
+        self.assertIn("external:provenance_identity_changed:source_repo", report["reasons"])
+
+    def test_score_component_regression_blocks_even_if_total_does_not_decrease(self):
+        before = {
+            "audit": {"findings": {}},
+            "security": {"flags": []},
+            "risk": {"declared": "safe", "suggested": "safe"},
+            "score": {
+                "scores": {
+                    "metadata": 90.0,
+                    "documentation": 80.0,
+                    "security": 90.0,
+                    "total": 86.0,
+                }
+            },
+        }
+        after = {
+            "audit": {"findings": {}},
+            "security": {"flags": []},
+            "risk": {"declared": "safe", "suggested": "safe"},
+            "score": {
+                "scores": {
+                    "metadata": 100.0,
+                    "documentation": 70.0,
+                    "security": 90.0,
+                    "total": 86.0,
+                }
+            },
+        }
+
+        reasons = changed_skill_evidence.regression_reasons(
+            "example", "modified", before, after
+        )
+
+        self.assertIn(
+            "example:score_component_decreased:documentation:80.0->70.0",
+            reasons,
+        )
+        self.assertFalse(any(reason.startswith("example:score_decreased:") for reason in reasons))
+
+    def test_explicit_repo_argument_uses_requested_git_repository(self):
+        root, base = init_repo()
+        output = root / "evidence.json"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "changed_skill_evidence.py"),
+                "--repo",
+                str(root),
+                "--base",
+                base,
+                "--head",
+                "HEAD",
+                "--output",
+                str(output),
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["head_oid"], base)
 
     def test_symlinked_skill_is_blocking_and_never_evaluated(self):
         root, base = init_repo()

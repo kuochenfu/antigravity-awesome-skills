@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
@@ -8,6 +9,7 @@ const { findProjectRoot } = require("../lib/project-root");
 const { parseRawDiff } = require("../lib/git-raw-diff");
 const {
   classifyChangeRecords,
+  classifyPathPolicy,
   hasQualityChecklist,
 } = require("../lib/workflow-contract");
 
@@ -33,6 +35,9 @@ const DISALLOWED_COAUTHOR_TRAILER_PATTERNS = [
   /:\s*claude\s+sonnet\b/i,
 ];
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/u;
+const EVIDENCE_SCHEMA_VERSION = 1;
+const EVIDENCE_TIMEOUT_MS = 120_000;
+const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
 const APPROVAL_WORKFLOW_PATHS = new Set([
   ".github/workflows/actionlint.yml",
   ".github/workflows/ci.yml",
@@ -155,6 +160,227 @@ function runCommandBuffer(command, args, cwd, options = {}) {
   return result.stdout;
 }
 
+function resolveMergeBase(projectRoot, baseOid, headOid, dependencies = {}) {
+  const execute = dependencies.runCommand || runCommand;
+  const mergeBase = execute("git", ["merge-base", baseOid, headOid], projectRoot, { capture: true });
+  return assertFullSha(mergeBase, "Pull request merge-base SHA");
+}
+
+function normalizeEvidenceRecord(record) {
+  return JSON.stringify({
+    status: String(record?.status || ""),
+    old_path: record?.old_path ?? null,
+    new_path: record?.new_path ?? null,
+    old_mode: String(record?.old_mode || ""),
+    new_mode: String(record?.new_mode || ""),
+    old_oid: String(record?.old_oid || ""),
+    new_oid: String(record?.new_oid || ""),
+    similarity: record?.similarity ?? null,
+  });
+}
+
+function isSkillContentRecord(record) {
+  return [record?.old_path, record?.new_path]
+    .filter((filePath) => typeof filePath === "string" && filePath)
+    .some((filePath) => ["canonical_skill", "skill_support"].includes(classifyPathPolicy(filePath).kind));
+}
+
+function assertFiniteSnapshotScores(snapshot, label) {
+  if (!snapshot || typeof snapshot !== "object") {
+    throw new Error(`${label} snapshot is missing.`);
+  }
+  const scores = snapshot?.score?.scores;
+  for (const component of ["metadata", "documentation", "security", "total"]) {
+    if (typeof scores?.[component] !== "number" || !Number.isFinite(scores[component])) {
+      throw new Error(`${label} score component ${component} is missing or non-finite.`);
+    }
+  }
+}
+
+function validateChangedSkillEvidence(report, expected) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) {
+    throw new Error("Changed-skill evidence must be a JSON object.");
+  }
+  if (report.schema_version !== EVIDENCE_SCHEMA_VERSION) {
+    throw new Error(`Changed-skill evidence schema must be ${EVIDENCE_SCHEMA_VERSION}.`);
+  }
+  for (const [field, value] of [
+    ["base_oid", expected.mergeBaseOid],
+    ["head_oid", expected.headOid],
+    ["base_ref", expected.mergeBaseOid],
+    ["head_ref", expected.headOid],
+  ]) {
+    if (report[field] !== value) {
+      throw new Error(`Changed-skill evidence ${field} does not match the validated tuple.`);
+    }
+  }
+  if (typeof report.blocking !== "boolean") {
+    throw new Error("Changed-skill evidence blocking must be boolean.");
+  }
+  if (!Array.isArray(report.reasons) || report.reasons.some((reason) => typeof reason !== "string")) {
+    throw new Error("Changed-skill evidence reasons must be an array of strings.");
+  }
+  if (!Array.isArray(report.changes)) {
+    throw new Error("Changed-skill evidence changes must be an array.");
+  }
+
+  const evidenceRecords = [];
+  for (const [index, change] of report.changes.entries()) {
+    if (!change || typeof change !== "object" || !Array.isArray(change.records) || !change.records.length) {
+      throw new Error(`Changed-skill evidence change ${index} has no covered Git records.`);
+    }
+    const type = String(change.change_type || "");
+    if (type === "modified" || type === "renamed") {
+      assertFiniteSnapshotScores(change.before, `change ${index} before`);
+      assertFiniteSnapshotScores(change.after, `change ${index} after`);
+    } else if (type === "added" || type === "copied") {
+      assertFiniteSnapshotScores(change.after, `change ${index} after`);
+    } else if (type === "deleted") {
+      assertFiniteSnapshotScores(change.before, `change ${index} before`);
+      if (change.after !== null) {
+        throw new Error(`Changed-skill evidence deletion ${index} must not contain an after snapshot.`);
+      }
+    } else {
+      throw new Error(`Changed-skill evidence change ${index} has unknown type ${type || "<missing>"}.`);
+    }
+    evidenceRecords.push(...change.records.map(normalizeEvidenceRecord));
+  }
+
+  const rawRecords = expected.rawRecords.filter(isSkillContentRecord).map(normalizeEvidenceRecord).sort();
+  evidenceRecords.sort();
+  if (new Set(evidenceRecords).size !== evidenceRecords.length) {
+    throw new Error("Changed-skill evidence contains duplicate Git records.");
+  }
+  if (rawRecords.length !== evidenceRecords.length || rawRecords.some((record, index) => record !== evidenceRecords[index])) {
+    throw new Error("Changed-skill evidence does not cover the exact skill-content Git diff.");
+  }
+  if (report.blocking !== (report.reasons.length > 0)) {
+    throw new Error("Changed-skill evidence blocking flag disagrees with its reasons.");
+  }
+  return report;
+}
+
+function resolveIsolatedPython() {
+  const candidates = [["python3"], ["python"], ["py", "-3"]];
+  for (const candidate of candidates) {
+    const [command, ...baseArgs] = candidate;
+    const probe = spawnSync(command, [...baseArgs, "-I", "-c", "import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)"], {
+      encoding: "utf8",
+      shell: false,
+      timeout: 10_000,
+      env: { PATH: process.env.PATH || "", SYSTEMROOT: process.env.SYSTEMROOT || "" },
+    });
+    if (!probe.error && probe.status === 0) {
+      return candidate;
+    }
+  }
+  throw new Error("Unable to find an isolated Python 3 interpreter for trusted evidence.");
+}
+
+function recomputeChangedSkillEvidence(
+  projectRoot,
+  { evaluatorOid, mergeBaseOid, headOid, rawRecords },
+  dependencies = {},
+) {
+  assertFullSha(evaluatorOid, "Trusted evaluator SHA");
+  assertFullSha(mergeBaseOid, "Evidence merge-base SHA");
+  assertFullSha(headOid, "Evidence head SHA");
+  const executeBuffer = dependencies.runCommandBuffer || runCommandBuffer;
+  const spawn = dependencies.spawnSync || spawnSync;
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "aas-trusted-evidence-"));
+  try {
+    const archive = executeBuffer(
+      "git",
+      ["archive", "--format=tar", evaluatorOid, "--", "tools/scripts"],
+      projectRoot,
+      { maxBuffer: 64 * 1024 * 1024 },
+    );
+    const extract = spawn("tar", ["-xf", "-", "-C", temporary], {
+      input: archive,
+      encoding: "utf8",
+      shell: false,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    if (extract.error || extract.status !== 0) {
+      throw new Error(`Could not materialize trusted evaluator: ${extract.error?.message || extract.stderr || "tar failed"}`);
+    }
+
+    const scriptsDir = path.join(temporary, "tools", "scripts");
+    const scriptPath = path.join(scriptsDir, "changed_skill_evidence.py");
+    const outputPath = path.join(temporary, "changed-skills.json");
+    const [python, ...pythonBaseArgs] = dependencies.pythonCommand || resolveIsolatedPython();
+    const bootstrap = [
+      "import runpy,sys",
+      "scripts=sys.argv[1]",
+      "script=sys.argv[2]",
+      "sys.path.insert(0,scripts)",
+      "sys.argv=[script,*sys.argv[3:]]",
+      "runpy.run_path(script,run_name='__main__')",
+    ].join(";");
+    const environment = {
+      PATH: process.env.PATH || "",
+      SYSTEMROOT: process.env.SYSTEMROOT || "",
+      TMPDIR: temporary,
+      TEMP: temporary,
+      TMP: temporary,
+      HOME: temporary,
+      LANG: "C.UTF-8",
+      LC_ALL: "C.UTF-8",
+      PYTHONDONTWRITEBYTECODE: "1",
+      PYTHONHASHSEED: "0",
+    };
+    const result = spawn(
+      python,
+      [
+        ...pythonBaseArgs,
+        "-I",
+        "-c",
+        bootstrap,
+        scriptsDir,
+        scriptPath,
+        "--repo",
+        projectRoot,
+        "--base",
+        mergeBaseOid,
+        "--head",
+        headOid,
+        "--output",
+        outputPath,
+      ],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        shell: false,
+        timeout: EVIDENCE_TIMEOUT_MS,
+        maxBuffer: 2 * 1024 * 1024,
+        env: environment,
+      },
+    );
+    if (result.error) {
+      throw new Error(`Trusted changed-skill evaluator failed: ${result.error.message}`);
+    }
+    if (![0, 1].includes(result.status)) {
+      throw new Error(`Trusted changed-skill evaluator exited unexpectedly (${result.status ?? result.signal ?? "unknown"}).`);
+    }
+    const stat = fs.statSync(outputPath);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_EVIDENCE_BYTES) {
+      throw new Error("Trusted changed-skill evidence output is missing, empty, or oversized.");
+    }
+    const report = validateChangedSkillEvidence(readJson(outputPath), {
+      mergeBaseOid,
+      headOid,
+      rawRecords,
+    });
+    if ((result.status === 1) !== report.blocking) {
+      throw new Error("Trusted changed-skill evaluator exit status disagrees with evidence blocking state.");
+    }
+    return report;
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 function fetchPullRequestObjects(projectRoot, baseOid, headOid, dependencies = {}) {
   const execute = dependencies.runCommand || runCommand;
   assertFullSha(baseOid, "Pull request base SHA");
@@ -274,6 +500,24 @@ function ensureOnMainAndClean(projectRoot) {
   }
 }
 
+function ensureTrustedMain(projectRoot, dependencies = {}) {
+  const execute = dependencies.runCommand || runCommand;
+  ensureOnMainAndClean(projectRoot);
+  execute("git", ["fetch", "--no-tags", "origin", "main"], projectRoot);
+  const localHead = assertFullSha(
+    execute("git", ["rev-parse", "HEAD"], projectRoot, { capture: true }),
+    "Local main SHA",
+  );
+  const remoteHead = assertFullSha(
+    execute("git", ["rev-parse", "origin/main"], projectRoot, { capture: true }),
+    "origin/main SHA",
+  );
+  if (localHead !== remoteHead) {
+    throw new Error(`merge-batch requires local main to equal origin/main (${localHead} != ${remoteHead}).`);
+  }
+  return localHead;
+}
+
 function parsePrList(prs) {
   if (!prs) {
     throw new Error("Usage: merge_batch.cjs --prs 450,449,446,451");
@@ -359,6 +603,8 @@ function loadPullRequestDetails(projectRoot, repoSlug, prNumber) {
   const details = runGhJson(projectRoot, ["pr", "view", String(prNumber)], {
     jsonFields: [
       "body",
+      "autoMergeRequest",
+      "baseRefName",
       "baseRefOid",
       "mergeStateStatus",
       "mergeable",
@@ -369,6 +615,125 @@ function loadPullRequestDetails(projectRoot, repoSlug, prNumber) {
     ].join(","),
   });
   return details;
+}
+
+function pullRequestTuple(prDetails) {
+  const number = Number(prDetails?.number);
+  if (prDetails?.autoMergeRequest) {
+    throw new Error(`PR #${number || "<unknown>"} already has deferred auto-merge enabled.`);
+  }
+  if (prDetails?.baseRefName !== "main") {
+    throw new Error(`PR #${number || "<unknown>"} must target main.`);
+  }
+  return {
+    baseOid: assertFullSha(prDetails?.baseRefOid, `PR #${number} base SHA`),
+    headOid: assertFullSha(prDetails?.headRefOid, `PR #${number} head SHA`),
+  };
+}
+
+function globMatchesRef(pattern, refName) {
+  if (pattern === "~ALL" || pattern === "~DEFAULT_BRANCH") {
+    return true;
+  }
+  if (/[\[\]\\]/u.test(String(pattern || ""))) {
+    return null;
+  }
+  const escaped = String(pattern || "")
+    .replace(/[.+^${}()|[\]\\]/gu, "\\$&")
+    .replace(/\*\*/gu, "\u0000")
+    .replace(/\*/gu, "[^/]*")
+    .replace(/\?/gu, "[^/]")
+    .replace(/\u0000/gu, ".*");
+  return new RegExp(`^${escaped}$`, "u").test(refName);
+}
+
+function rulesetAppliesToMain(ruleset) {
+  if (String(ruleset?.enforcement || "").toLowerCase() !== "active" || ruleset?.target !== "branch") {
+    return false;
+  }
+  const refCondition = ruleset?.conditions?.ref_name;
+  if (!refCondition) {
+    return true;
+  }
+  const refName = "refs/heads/main";
+  const excludeMatches = Array.isArray(refCondition.exclude)
+    ? refCondition.exclude.map((pattern) => globMatchesRef(pattern, refName))
+    : [];
+  if (excludeMatches.includes(null)) {
+    return true;
+  }
+  const excluded = excludeMatches.includes(true);
+  if (excluded) {
+    return false;
+  }
+  const includes = Array.isArray(refCondition.include) ? refCondition.include : [];
+  const includeMatches = includes.map((pattern) => globMatchesRef(pattern, refName));
+  return includes.length === 0 || includeMatches.includes(null) || includeMatches.includes(true);
+}
+
+function assertUnchangedTuple(prDetails, expected, phase, prNumber) {
+  const actual = pullRequestTuple(prDetails);
+  if (actual.baseOid !== expected.baseOid || actual.headOid !== expected.headOid) {
+    throw new Error(
+      `PR #${prNumber} base/head changed ${phase}: expected ${expected.baseOid}/${expected.headOid}, ` +
+      `received ${actual.baseOid}/${actual.headOid}. Rerun merge:batch.`,
+    );
+  }
+  return actual;
+}
+
+function validateEffectiveMainProtection(protection, rulesets = []) {
+  const required = protection?.required_status_checks;
+  const checks = [
+    ...(Array.isArray(required?.checks) ? required.checks : []),
+    ...(Array.isArray(required?.contexts) ? required.contexts : []),
+  ];
+  if (required?.strict !== true || checks.length === 0) {
+    throw new Error("main protection must require nonempty strict up-to-date status checks.");
+  }
+  if (protection?.enforce_admins?.enabled !== true) {
+    throw new Error("main protection must apply to administrators.");
+  }
+  const applicableRulesets = rulesets.filter(rulesetAppliesToMain);
+  const bypassing = applicableRulesets.filter((ruleset) =>
+    Array.isArray(ruleset?.bypass_actors) && ruleset.bypass_actors.length > 0,
+  );
+  if (bypassing.length) {
+    throw new Error(`Cannot prove latest-base enforcement because rulesets have bypass actors: ${bypassing.map((item) => item.id).join(", ")}.`);
+  }
+  const mergeQueues = applicableRulesets.filter((ruleset) =>
+    Array.isArray(ruleset?.rules) && ruleset.rules.some((rule) => rule?.type === "merge_queue"),
+  );
+  if (mergeQueues.length) {
+    throw new Error(`merge-batch does not support deferred merge queues: ${mergeQueues.map((item) => item.id).join(", ")}.`);
+  }
+  return true;
+}
+
+function loadEffectiveMainProtection(projectRoot, repoSlug, dependencies = {}) {
+  const api = dependencies.runGhApiJson || runGhApiJson;
+  const protection = api(projectRoot, [`repos/${repoSlug}/branches/main/protection`]);
+  const pages = api(
+    projectRoot,
+    [`repos/${repoSlug}/rulesets?includes_parents=true&per_page=100`],
+    { paginate: true, slurp: true },
+  );
+  const summaries = flattenGhSlurpPayload(pages);
+  const rulesets = summaries
+    .filter((ruleset) => Number.isInteger(Number(ruleset?.id)))
+    .map((ruleset) => api(projectRoot, [`repos/${repoSlug}/rulesets/${Number(ruleset.id)}`]));
+  return { protection, rulesets };
+}
+
+function assertEffectiveMainProtection(projectRoot, repoSlug, dependencies = {}) {
+  const load = dependencies.loadEffectiveMainProtection || loadEffectiveMainProtection;
+  let state;
+  try {
+    state = load(projectRoot, repoSlug, dependencies);
+  } catch (error) {
+    throw new Error(`Cannot prove effective main protection: ${error.message}`);
+  }
+  validateEffectiveMainProtection(state?.protection, state?.rulesets);
 }
 
 function needsBodyRefresh(prDetails) {
@@ -558,13 +923,6 @@ function formatCheckSummary(summaries) {
     .join(", ");
 }
 
-function getHeadSha(projectRoot, repoSlug, prNumber) {
-  const details = runGhJson(projectRoot, ["pr", "view", String(prNumber)], {
-    jsonFields: "headRefOid",
-  });
-  return details.headRefOid;
-}
-
 function listActionRequiredRuns(projectRoot, repoSlug, headSha) {
   const payload = runGhApiJson(projectRoot, [
     `repos/${repoSlug}/actions/runs?head_sha=${headSha}&status=action_required&per_page=100`,
@@ -657,25 +1015,18 @@ function approveWorkflowRun(projectRoot, repoSlug, run) {
   );
 }
 
-function assertUnchangedHead(actual, expected, phase, prNumber) {
-  assertFullSha(actual, `PR #${prNumber} ${phase} head SHA`);
-  if (actual !== expected) {
-    throw new Error(
-      `PR #${prNumber} head changed ${phase}: expected ${expected}, received ${actual}. Rerun merge:batch and review the new head.`,
-    );
-  }
-}
-
 function approveActionRequiredRuns(projectRoot, repoSlug, prDetails, options = {}) {
   const prNumber = Number(prDetails?.number);
-  const baseOid = assertFullSha(prDetails?.baseRefOid, `PR #${prNumber} base SHA`);
-  const headOid = assertFullSha(prDetails?.headRefOid, `PR #${prNumber} head SHA`);
+  const tuple = pullRequestTuple(prDetails);
+  const { baseOid, headOid } = tuple;
   const dependencies = options.dependencies || {};
   const fetchObjects = dependencies.fetchPullRequestObjects || fetchPullRequestObjects;
+  const getMergeBase = dependencies.resolveMergeBase || resolveMergeBase;
   const readRecords = dependencies.readRawChangeRecords || readRawChangeRecords;
   const getSizes = dependencies.resolveBlobSizes || resolveBlobSizes;
   const classifyRecords = dependencies.classifyChangeRecords || classifyChangeRecords;
-  const getCurrentHead = dependencies.getHeadSha || getHeadSha;
+  const recomputeEvidence = dependencies.recomputeChangedSkillEvidence || recomputeChangedSkillEvidence;
+  const getCurrentDetails = dependencies.loadPullRequestDetails || loadPullRequestDetails;
   const getRuns = dependencies.listActionRequiredRuns || listActionRequiredRuns;
   const getWorkflows = dependencies.listWorkflowDefinitions || listWorkflowDefinitions;
   const approveRun = dependencies.approveWorkflowRun || approveWorkflowRun;
@@ -685,7 +1036,15 @@ function approveActionRequiredRuns(projectRoot, repoSlug, prDetails, options = {
   }
 
   fetchObjects(projectRoot, baseOid, headOid, dependencies);
-  const records = readRecords(projectRoot, baseOid, headOid, dependencies);
+  const mergeBaseOid = getMergeBase(projectRoot, baseOid, headOid, dependencies);
+  const records = readRecords(projectRoot, mergeBaseOid, headOid, dependencies);
+  const preliminaryPolicy = classifyRecords(records, { requireBlobSizes: false });
+  if (!preliminaryPolicy?.approvalSafe) {
+    const reasons = Array.isArray(preliminaryPolicy?.reasons) && preliminaryPolicy.reasons.length
+      ? preliminaryPolicy.reasons.slice(0, 12).join(", ")
+      : "unclassified local diff";
+    throw new Error(`PR #${prNumber} local base-to-head diff is not fork-approval-safe: ${reasons}.`);
+  }
   const blobSizes = getSizes(projectRoot, records, dependencies);
   const policy = classifyRecords(records, { blobSizes });
   if (!policy?.approvalSafe) {
@@ -693,6 +1052,20 @@ function approveActionRequiredRuns(projectRoot, repoSlug, prDetails, options = {
       ? policy.reasons.slice(0, 12).join(", ")
       : "unclassified local diff";
     throw new Error(`PR #${prNumber} local base-to-head diff is not fork-approval-safe: ${reasons}.`);
+  }
+
+  const evaluatorOid = assertFullSha(
+    options.evaluatorOid || dependencies.getEvaluatorOid?.(projectRoot),
+    "Trusted evaluator SHA",
+  );
+  const evidence = recomputeEvidence(
+    projectRoot,
+    { evaluatorOid, mergeBaseOid, headOid, rawRecords: records },
+    dependencies,
+  );
+  if (evidence.blocking) {
+    const reasons = evidence.reasons.slice(0, 12).join(", ") || "unspecified regression";
+    throw new Error(`PR #${prNumber} trusted changed-skill evidence is blocking: ${reasons}.`);
   }
 
   const reviewedHeads = new Set(options.reviewedHeads || []);
@@ -712,15 +1085,29 @@ function approveActionRequiredRuns(projectRoot, repoSlug, prDetails, options = {
     options.allowedWorkflowPaths || APPROVAL_WORKFLOW_PATHS,
   );
 
-  assertUnchangedHead(getCurrentHead(projectRoot, repoSlug, prNumber), headOid, "before approvals", prNumber);
+  assertUnchangedTuple(
+    getCurrentDetails(projectRoot, repoSlug, prNumber),
+    tuple,
+    "before approvals",
+    prNumber,
+  );
   if (!options.dryRun) {
     for (const run of validatedRuns) {
       approveRun(projectRoot, repoSlug, run);
     }
   }
-  assertUnchangedHead(getCurrentHead(projectRoot, repoSlug, prNumber), headOid, "after approvals", prNumber);
+  assertUnchangedTuple(
+    getCurrentDetails(projectRoot, repoSlug, prNumber),
+    tuple,
+    "after approvals",
+    prNumber,
+  );
 
   return {
+    tuple,
+    evaluatorOid,
+    mergeBaseOid,
+    evidence,
     records,
     policy,
     runs: validatedRuns,
@@ -780,6 +1167,35 @@ function patchPrBody(projectRoot, repoSlug, prNumber, body) {
 function closeAndReopenPr(projectRoot, prNumber) {
   runCommand("gh", ["pr", "close", String(prNumber), "--comment", REOPEN_COMMENT], projectRoot);
   runCommand("gh", ["pr", "reopen", String(prNumber)], projectRoot);
+}
+
+function mergePullRequestImmediately(projectRoot, repoSlug, prDetails, dependencies = {}) {
+  const execute = dependencies.runCommand || runCommand;
+  const headOid = assertFullSha(prDetails?.headRefOid, `PR #${prDetails?.number} head SHA`);
+  const payload = JSON.stringify({
+    merge_method: "squash",
+    sha: headOid,
+    commit_title: buildSquashMergeSubject(prDetails),
+    commit_message: buildSquashMergeBody(prDetails),
+  });
+  const stdout = execute(
+    "gh",
+    ["api", `repos/${repoSlug}/pulls/${prDetails.number}/merge`, "-X", "PUT", "--input", "-"],
+    projectRoot,
+    { capture: true, input: payload },
+  );
+  let response;
+  try {
+    response = JSON.parse(stdout || "null");
+  } catch (error) {
+    throw new Error(`PR #${prDetails.number} merge endpoint returned invalid JSON: ${error.message}`);
+  }
+  if (response?.merged !== true || !FULL_SHA_PATTERN.test(String(response?.sha || ""))) {
+    throw new Error(
+      `PR #${prDetails.number} was not merged immediately: ${response?.message || "merge endpoint returned merged=false"}.`,
+    );
+  }
+  return response;
 }
 
 function isRetryableMergeError(error) {
@@ -856,6 +1272,7 @@ async function mergePullRequest(projectRoot, repoSlug, prNumber, options) {
 
   const approval = approveActionRequiredRuns(projectRoot, repoSlug, prDetails, {
     dryRun: options.dryRun,
+    evaluatorOid: options.evaluatorOid,
     reviewedHeads: options.reviewedHeads,
     dependencies: options.approvalDependencies,
   });
@@ -890,53 +1307,19 @@ async function mergePullRequest(projectRoot, repoSlug, prNumber, options) {
     };
   }
 
-  let merged = false;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      if (!options.dryRun) {
-        runCommand(
-          "gh",
-          [
-            "pr",
-            "merge",
-            String(prNumber),
-            "--squash",
-            "--subject",
-            buildSquashMergeSubject(prDetails),
-            "--body",
-            buildSquashMergeBody(prDetails),
-            "--match-head-commit",
-            headSha,
-          ],
-          projectRoot,
-        );
-      }
-      merged = true;
-      break;
-    } catch (error) {
-      if (!isRetryableMergeError(error) || attempt === 3) {
-        throw error;
-      }
-
-      console.log(`[merge-batch] PR #${prNumber}: base branch changed, refreshing main and retrying merge.`);
-      gitCheckoutMain(projectRoot);
-      gitPullMain(projectRoot);
-      prDetails = loadPullRequestDetails(projectRoot, repoSlug, prNumber);
-      const refreshedSha = prDetails.headRefOid || headSha;
-      if (refreshedSha !== headSha) {
-        throw new Error(
-          `PR #${prNumber} head changed during merge retry. Rerun merge:batch and review ${refreshedSha}.`,
-        );
-      }
-      if (!options.dryRun) {
-        await waitForRequiredChecks(projectRoot, repoSlug, refreshedSha, requiredCheckAliases, options.pollSeconds);
-      }
-    }
-  }
-
-  if (!merged) {
-    throw new Error(`Failed to merge PR #${prNumber}.`);
-  }
+  assertUnchangedTuple(
+    loadPullRequestDetails(projectRoot, repoSlug, prNumber),
+    approval.tuple,
+    "immediately before merge",
+    prNumber,
+  );
+  assertEffectiveMainProtection(
+    projectRoot,
+    repoSlug,
+    options.protectionDependencies,
+  );
+  mergePullRequestImmediately(projectRoot, repoSlug, prDetails, options.mergeDependencies);
+  const merged = true;
 
   console.log(`[merge-batch] PR #${prNumber}: merged.`);
 
@@ -962,10 +1345,16 @@ async function runBatch(projectRoot, prNumbers, options = {}) {
   const repoSlug = readRepositorySlug(projectRoot);
   const results = [];
 
-  ensureOnMainAndClean(projectRoot);
+  const evaluatorOid = ensureTrustedMain(projectRoot, options.mainDependencies);
+  if (!options.dryRun) {
+    assertEffectiveMainProtection(projectRoot, repoSlug, options.protectionDependencies);
+  }
 
   for (const prNumber of prNumbers) {
-    const result = await mergePullRequest(projectRoot, repoSlug, prNumber, options);
+    const result = await mergePullRequest(projectRoot, repoSlug, prNumber, {
+      ...options,
+      evaluatorOid,
+    });
     results.push(result);
   }
 
@@ -1003,7 +1392,9 @@ module.exports = {
   approvalWorkflowPaths: APPROVAL_WORKFLOW_PATHS,
   approveActionRequiredRuns,
   approveWorkflowRun,
+  assertEffectiveMainProtection,
   assertFullSha,
+  assertUnchangedTuple,
   baseBranchModifiedPatterns: BASE_BRANCH_MODIFIED_PATTERNS,
   buildSquashMergeBody,
   buildSquashMergeSubject,
@@ -1011,6 +1402,7 @@ module.exports = {
   closeAndReopenPr,
   commitAndPushReadmeIfChanged,
   ensureOnMainAndClean,
+  ensureTrustedMain,
   extractSummaryBlock,
   extractTemplateSections,
   formatCheckSummary,
@@ -1022,16 +1414,22 @@ module.exports = {
   listActionRequiredRuns,
   listCheckRuns,
   listWorkflowDefinitions,
+  loadEffectiveMainProtection,
   loadPullRequestDetails,
   loadPullRequestTemplate,
   mergePullRequest,
+  mergePullRequestImmediately,
   mergeableIsConflict,
   normalizePrBody,
   parseArgs,
   parsePrList,
   parseRawDiff,
+  pullRequestTuple,
   readRawChangeRecords,
   readRepositorySlug,
+  recomputeChangedSkillEvidence,
+  resolveMergeBase,
+  rulesetAppliesToMain,
   runCommand,
   runCommandBuffer,
   runBatch,
@@ -1039,6 +1437,8 @@ module.exports = {
   stripDisallowedCoauthorTrailers,
   summarizeRequiredCheckRuns,
   validateActionRequiredRuns,
+  validateChangedSkillEvidence,
+  validateEffectiveMainProtection,
   waitForRequiredChecks,
   resolveBlobSizes,
 };

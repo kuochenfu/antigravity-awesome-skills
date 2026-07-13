@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -287,6 +288,26 @@ def regression_reasons(
         reasons.append(
             f"{skill_id}:score_decreased:{before_score['scores']['total']}->{after_score['scores']['total']}"
         )
+    if before_score and after_score and "scores" in before_score and "scores" in after_score:
+        before_components = before_score["scores"]
+        after_components = after_score["scores"]
+        for component in sorted(set(before_components) | set(after_components)):
+            if component == "total":
+                continue
+            before_value = before_components.get(component)
+            after_value = after_components.get(component)
+            if (
+                isinstance(before_value, (int, float))
+                and not isinstance(before_value, bool)
+                and isinstance(after_value, (int, float))
+                and not isinstance(after_value, bool)
+                and math.isfinite(before_value)
+                and math.isfinite(after_value)
+                and after_value < before_value
+            ):
+                reasons.append(
+                    f"{skill_id}:score_component_decreased:{component}:{before_value}->{after_value}"
+                )
 
     before_declared = str(before["risk"].get("declared") or "unknown").lower() if before else "unknown"
     after_declared = str(after["risk"].get("declared") or "unknown").lower()
@@ -300,24 +321,43 @@ def regression_reasons(
 def provenance_reasons(
     skill_id: str,
     change_type: str,
+    before: dict[str, object] | None,
     after: dict[str, object] | None,
     readme_credits: dict[str, set[str]],
 ) -> list[str]:
-    if change_type not in {"added", "copied"} or after is None:
+    if change_type == "deleted" or after is None:
         return []
     provenance = after["provenance"]
     source = provenance.get("source")
     source_type = provenance.get("source_type")
     source_repo = provenance.get("source_repo")
-    if isinstance(source, str) and source.strip().lower() == "self":
-        return []
-    if source_type not in {"official", "community"}:
-        return [f"{skill_id}:new_external_skill_invalid_source_type"]
-    if not isinstance(source_repo, str) or not SOURCE_REPO_PATTERN.fullmatch(source_repo):
-        return [f"{skill_id}:new_external_skill_invalid_source_repo"]
-    if source_repo not in readme_credits[source_type]:
-        return [f"{skill_id}:new_external_skill_missing_readme_credit:{source_type}:{source_repo}"]
-    return []
+    reasons: list[str] = []
+    source_is_self = isinstance(source, str) and source.strip().lower() == "self"
+    before_provenance = before.get("provenance") if before else None
+    before_source = before_provenance.get("source") if before_provenance else None
+    before_is_self = (
+        isinstance(before_source, str) and before_source.strip().lower() == "self"
+    )
+
+    if change_type in {"modified", "renamed"} and before_provenance:
+        if not before_is_self or not source_is_self:
+            for field in ("source", "source_type", "source_repo"):
+                if before_provenance.get(field) != provenance.get(field):
+                    reasons.append(f"{skill_id}:provenance_identity_changed:{field}")
+
+    needs_full_validation = change_type in {"added", "copied"} or (
+        before_provenance is not None and before_is_self and not source_is_self
+    )
+    if not source_is_self and needs_full_validation:
+        if source_type not in {"official", "community"}:
+            reasons.append(f"{skill_id}:new_external_skill_invalid_source_type")
+        if not isinstance(source_repo, str) or not SOURCE_REPO_PATTERN.fullmatch(source_repo):
+            reasons.append(f"{skill_id}:new_external_skill_invalid_source_repo")
+        elif source_type in readme_credits and source_repo not in readme_credits[source_type]:
+            reasons.append(
+                f"{skill_id}:new_external_skill_missing_readme_credit:{source_type}:{source_repo}"
+            )
+    return reasons
 
 
 def _unsafe_counter(entries: list[dict[str, str]], skill_id: str | None) -> Counter[tuple[str, str, str]]:
@@ -395,7 +435,15 @@ def build_report(repo: str | Path, base_ref: str, head_ref: str) -> dict[str, ob
                         )
             comparison_before = None if change_type in {"added", "copied"} else before
             reasons.extend(regression_reasons(effective_id, change_type, comparison_before, after))
-            reasons.extend(provenance_reasons(effective_id, change_type, after, readme_credits))
+            reasons.extend(
+                provenance_reasons(
+                    effective_id,
+                    change_type,
+                    comparison_before,
+                    after,
+                    readme_credits,
+                )
+            )
             reasons = sorted(set(reasons))
             all_reasons.extend(reasons)
             changes.append(
@@ -435,13 +483,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        help="Repository whose immutable Git objects should be evaluated (defaults to the script checkout).",
+    )
     parser.add_argument("--json", action="store_true", help="Also print the report to stdout.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    root = find_repo_root(__file__)
+    root = args.repo.resolve() if args.repo else find_repo_root(__file__)
     report = build_report(root, args.base, args.head)
     payload = stable_json(report)
     args.output.parent.mkdir(parents=True, exist_ok=True)

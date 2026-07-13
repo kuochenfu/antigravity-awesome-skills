@@ -20,6 +20,20 @@ function makeCheckRun(name, status, conclusion, startedAt, id) {
   };
 }
 
+function evidenceSnapshot(overrides = {}) {
+  return {
+    score: {
+      scores: {
+        metadata: 90,
+        documentation: 80,
+        security: 100,
+        total: 90,
+      },
+    },
+    ...overrides,
+  };
+}
+
 {
   const parsed = mergeBatch.parsePrList("450, 449  446");
   assert.deepStrictEqual(parsed, [450, 449, 446]);
@@ -253,18 +267,23 @@ function approvalDependencies(overrides = {}) {
   };
   return {
     fetchPullRequestObjects() {},
+    resolveMergeBase() { return BASE_SHA; },
     readRawChangeRecords() { return [record]; },
     resolveBlobSizes() { return new Map([[BLOB_SHA, 100]]); },
+    getEvaluatorOid() { return "4".repeat(40); },
+    recomputeChangedSkillEvidence() { return { blocking: false, reasons: [] }; },
+    loadPullRequestDetails() {
+      return { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+    },
     listWorkflowDefinitions() { return [workflowFixture()]; },
     listActionRequiredRuns() { return [runFixture()]; },
-    getHeadSha() { return HEAD_SHA; },
     approveWorkflowRun() {},
     ...overrides,
   };
 }
 
 {
-  const prDetails = { number: 450, baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
   const supportRecord = {
     status: "M",
     old_path: "skills/example/references/guide.md",
@@ -293,11 +312,14 @@ function approvalDependencies(overrides = {}) {
 }
 
 {
-  const prDetails = { number: 450, baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
   let approvals = 0;
-  let headReads = 0;
+  let tupleReads = 0;
   const dependencies = approvalDependencies({
-    getHeadSha() { headReads += 1; return HEAD_SHA; },
+    loadPullRequestDetails() {
+      tupleReads += 1;
+      return { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+    },
     approveWorkflowRun() { approvals += 1; },
   });
   assert.throws(
@@ -319,12 +341,12 @@ function approvalDependencies(overrides = {}) {
     reviewedHeads: [HEAD_SHA],
   });
   assert.strictEqual(approvals, 1);
-  assert.strictEqual(headReads, 2);
+  assert.strictEqual(tupleReads, 2);
   assert.deepStrictEqual(result.approvedRuns.map((run) => run.id), [200]);
 }
 
 {
-  const prDetails = { number: 450, baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
   let approvals = 0;
   const result = mergeBatch.approveActionRequiredRuns("/repo", "owner/repo", prDetails, {
     dependencies: approvalDependencies({ approveWorkflowRun() { approvals += 1; } }),
@@ -337,7 +359,7 @@ function approvalDependencies(overrides = {}) {
 }
 
 {
-  const prDetails = { number: 450, baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
   let approvals = 0;
   const dependencies = approvalDependencies({
     listActionRequiredRuns() {
@@ -372,10 +394,12 @@ function approvalDependencies(overrides = {}) {
 }
 
 {
-  const prDetails = { number: 450, baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
   let approvals = 0;
   const dependencies = approvalDependencies({
-    getHeadSha() { return BASE_SHA; },
+    loadPullRequestDetails() {
+      return { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: BASE_SHA };
+    },
     approveWorkflowRun() { approvals += 1; },
   });
   assert.throws(
@@ -389,9 +413,11 @@ function approvalDependencies(overrides = {}) {
 }
 
 {
-  const prDetails = { number: 450, baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
   let approvals = 0;
+  let blobReads = 0;
   const dependencies = approvalDependencies({
+    resolveBlobSizes() { blobReads += 1; return new Map([[BLOB_SHA, 100]]); },
     classifyChangeRecords() {
       return { approvalSafe: false, reasons: ["record_0:new_executable_mode"] };
     },
@@ -405,6 +431,238 @@ function approvalDependencies(overrides = {}) {
     /not fork-approval-safe/,
   );
   assert.strictEqual(approvals, 0);
+  assert.strictEqual(blobReads, 0, "structurally unsafe diffs must fail before blob expansion");
+}
+
+{
+  const record = {
+    status: "M",
+    old_path: "skills/example/SKILL.md",
+    new_path: "skills/example/SKILL.md",
+    old_mode: "100644",
+    new_mode: "100644",
+    old_oid: BASE_SHA,
+    new_oid: BLOB_SHA,
+    similarity: null,
+  };
+  const report = {
+    schema_version: 1,
+    base_ref: BASE_SHA,
+    head_ref: HEAD_SHA,
+    base_oid: BASE_SHA,
+    head_oid: HEAD_SHA,
+    blocking: false,
+    reasons: [],
+    changes: [{
+      change_type: "modified",
+      before: evidenceSnapshot(),
+      after: evidenceSnapshot(),
+      records: [record],
+    }],
+  };
+  assert.strictEqual(
+    mergeBatch.validateChangedSkillEvidence(report, {
+      mergeBaseOid: BASE_SHA,
+      headOid: HEAD_SHA,
+      rawRecords: [record],
+    }),
+    report,
+  );
+  assert.throws(
+    () => mergeBatch.validateChangedSkillEvidence(
+      { ...report, head_oid: BLOB_SHA },
+      { mergeBaseOid: BASE_SHA, headOid: HEAD_SHA, rawRecords: [record] },
+    ),
+    /head_oid does not match/,
+  );
+  assert.throws(
+    () => mergeBatch.validateChangedSkillEvidence(
+      { ...report, changes: [{ ...report.changes[0], records: [record, record] }] },
+      { mergeBaseOid: BASE_SHA, headOid: HEAD_SHA, rawRecords: [record] },
+    ),
+    /duplicate Git records/,
+  );
+  const orphan = { ...record, old_path: "skills/orphan/assets/note.md", new_path: "skills/orphan/assets/note.md" };
+  assert.throws(
+    () => mergeBatch.validateChangedSkillEvidence(
+      { ...report, changes: [] },
+      { mergeBaseOid: BASE_SHA, headOid: HEAD_SHA, rawRecords: [orphan] },
+    ),
+    /exact skill-content Git diff/,
+  );
+  assert.throws(
+    () => mergeBatch.validateChangedSkillEvidence(
+      { ...report, changes: [{ ...report.changes[0], after: evidenceSnapshot({ score: { scores: { metadata: NaN } } }) }] },
+      { mergeBaseOid: BASE_SHA, headOid: HEAD_SHA, rawRecords: [record] },
+    ),
+    /missing or non-finite/,
+  );
+}
+
+{
+  const protection = {
+    required_status_checks: { strict: true, checks: [{ context: "pr-evidence", app_id: 1 }] },
+    enforce_admins: { enabled: true },
+  };
+  assert.strictEqual(mergeBatch.validateEffectiveMainProtection(protection, []), true);
+  assert.throws(
+    () => mergeBatch.validateEffectiveMainProtection(
+      { ...protection, required_status_checks: { strict: false, checks: [{ context: "pr-evidence" }] } },
+      [],
+    ),
+    /strict up-to-date/,
+  );
+  assert.throws(
+    () => mergeBatch.validateEffectiveMainProtection(
+      protection,
+      [{
+        id: 9,
+        enforcement: "active",
+        target: "branch",
+        conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
+        bypass_actors: [{ actor_id: 1 }],
+      }],
+    ),
+    /bypass actors/,
+  );
+  assert.strictEqual(
+    mergeBatch.validateEffectiveMainProtection(protection, [{
+      id: 10,
+      enforcement: "active",
+      target: "tag",
+      bypass_actors: [{ actor_id: 1 }],
+    }]),
+    true,
+    "tag rulesets must not block main",
+  );
+  assert.strictEqual(
+    mergeBatch.validateEffectiveMainProtection(protection, [{
+      id: 11,
+      enforcement: "evaluate",
+      target: "branch",
+      conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
+      bypass_actors: [{ actor_id: 1 }],
+    }]),
+    true,
+    "non-enforcing evaluation rulesets must not block main",
+  );
+  assert.throws(
+    () => mergeBatch.validateEffectiveMainProtection(protection, [{
+      id: 12,
+      enforcement: "active",
+      target: "branch",
+      conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+      bypass_actors: [],
+      rules: [{ type: "merge_queue" }],
+    }]),
+    /does not support deferred merge queues/,
+  );
+  assert.throws(
+    () => mergeBatch.validateEffectiveMainProtection(protection, [{
+      id: 13,
+      enforcement: "active",
+      target: "branch",
+      conditions: { ref_name: { include: ["refs/heads/ma[i]n"], exclude: [] } },
+      bypass_actors: [{ actor_id: 1 }],
+    }]),
+    /bypass actors/,
+    "unsupported fnmatch syntax must fail closed as potentially applicable to main",
+  );
+}
+
+{
+  const calls = [];
+  const state = mergeBatch.loadEffectiveMainProtection("/repo", "owner/repo", {
+    runGhApiJson(_root, args, options = {}) {
+      calls.push([args[0], options]);
+      if (args[0].endsWith("/branches/main/protection")) {
+        return { required_status_checks: { strict: true, checks: [{ context: "ci" }] }, enforce_admins: { enabled: true } };
+      }
+      if (args[0].includes("/rulesets?")) {
+        return [[{ id: 101 }], [{ id: 202 }]];
+      }
+      return { id: Number(args[0].split("/").at(-1)), enforcement: "active", target: "branch" };
+    },
+  });
+  assert.deepStrictEqual(state.rulesets.map((item) => item.id), [101, 202]);
+  const paginated = calls.find(([endpoint]) => endpoint.includes("/rulesets?"));
+  assert.strictEqual(paginated[1].paginate, true);
+  assert.strictEqual(paginated[1].slurp, true);
+}
+
+{
+  const prDetails = {
+    number: 450,
+    title: "feat: safe change",
+    body: "Summary",
+    headRefOid: HEAD_SHA,
+  };
+  let captured;
+  const merged = mergeBatch.mergePullRequestImmediately("/repo", "owner/repo", prDetails, {
+    runCommand(command, args, _cwd, options) {
+      captured = { command, args, payload: JSON.parse(options.input) };
+      return JSON.stringify({ merged: true, sha: BLOB_SHA, message: "Pull Request successfully merged" });
+    },
+  });
+  assert.strictEqual(merged.merged, true);
+  assert.strictEqual(captured.command, "gh");
+  assert.ok(captured.args.includes("PUT"));
+  assert.strictEqual(captured.payload.sha, HEAD_SHA);
+  assert.strictEqual(captured.payload.merge_method, "squash");
+  assert.throws(
+    () => mergeBatch.mergePullRequestImmediately("/repo", "owner/repo", prDetails, {
+      runCommand() { return JSON.stringify({ merged: false, message: "queued" }); },
+    }),
+    /was not merged immediately: queued/,
+  );
+}
+
+{
+  const prDetails = { number: 450, baseRefName: "main", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA };
+  let approvals = 0;
+  const dependencies = approvalDependencies({
+    recomputeChangedSkillEvidence() {
+      return { blocking: true, reasons: ["example:score_decreased:90->80"] };
+    },
+    approveWorkflowRun() { approvals += 1; },
+  });
+  assert.throws(
+    () => mergeBatch.approveActionRequiredRuns("/repo", "owner/repo", prDetails, {
+      dependencies,
+      reviewedHeads: [HEAD_SHA],
+    }),
+    /trusted changed-skill evidence is blocking/,
+  );
+  assert.strictEqual(approvals, 0);
+}
+
+{
+  const expected = { baseOid: BASE_SHA, headOid: HEAD_SHA };
+  assert.throws(
+    () => mergeBatch.assertUnchangedTuple(
+      { number: 450, baseRefName: "main", baseRefOid: BLOB_SHA, headRefOid: HEAD_SHA },
+      expected,
+      "before merge",
+      450,
+    ),
+    /base\/head changed before merge/,
+  );
+  assert.throws(
+    () => mergeBatch.pullRequestTuple(
+      { number: 450, baseRefName: "develop", baseRefOid: BASE_SHA, headRefOid: HEAD_SHA },
+    ),
+    /must target main/,
+  );
+  assert.throws(
+    () => mergeBatch.pullRequestTuple({
+      number: 450,
+      baseRefName: "main",
+      baseRefOid: BASE_SHA,
+      headRefOid: HEAD_SHA,
+      autoMergeRequest: { enabledAt: "2026-07-13T00:00:00Z" },
+    }),
+    /deferred auto-merge enabled/,
+  );
 }
 
 console.log("ok");
